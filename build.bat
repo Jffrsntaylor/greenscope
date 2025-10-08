@@ -2,12 +2,15 @@
 setlocal
 cd /d %~dp0
 
+set "SKIP_PAUSE="
+if /i "%~1"=="--no-pause" set "SKIP_PAUSE=1"
+
 REM Detect MSYS2 UCRT64 gcc
 where gcc >nul 2>nul
 if errorlevel 1 (
   echo [!] gcc not found on PATH. Open "MSYS2 MinGW UCRT64" and run:
   echo     pacman -S --needed mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-binutils
-  pause
+  call :maybe_pause
   exit /b 1
 )
 
@@ -31,8 +34,13 @@ if errorlevel 1 (
 :done
 if errorlevel 1 (
   echo [!] Build failed.
-  pause
+  call :maybe_pause
   exit /b 1
 )
 echo [OK] Built GreenScope.exe
-pause
+call :maybe_pause
+exit /b 0
+
+:maybe_pause
+if not defined SKIP_PAUSE pause
+exit /b 0
