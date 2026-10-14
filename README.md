@@ -7,6 +7,7 @@ Green-on-black Windows console system monitor written in C. Minimal, fast, retro
 ## Features
 - CPU usage (overall)
 - Memory usage (total/free)
+- NVIDIA GPU: utilization, VRAM, temperature, power, clocks, and what's limiting it (via the driver's NVML, no install)
 - Disk usage (all fixed drives)
 - Network throughput (sum of active adapters)
 - Clock (top-right), uptime, and battery indicator

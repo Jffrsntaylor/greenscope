@@ -9,7 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define GS_VERSION "0.5.2"
+#define GS_VERSION "0.5.3"
 
 static int g_use_utf8 = 1; // toggle with 'A'
 
@@ -26,6 +26,8 @@ static const char *bx(const char *uni, const char *ascii){ return g_use_utf8 ? u
 // End of line: clear whatever a longer previous frame left to the right of the cursor.
 #define EOL "\x1b[K\n"
 #define VT_CLEAR "\x1b[2J\x1b[H"
+// Clear from the cursor to the end of the screen: drops rows left over when the frame gets shorter.
+#define VT_CLEAR_BELOW "\x1b[J"
 
 // ---- console state: saved at startup, restored on Q, Ctrl+C or window close ----
 static HANDLE g_out, g_in;
@@ -34,6 +36,7 @@ static CONSOLE_CURSOR_INFO g_orig_cursor;
 static DWORD g_orig_out_mode, g_orig_in_mode;
 static int g_have_attr, g_have_cursor, g_have_out_mode, g_have_in_mode;
 static volatile LONG g_restored = 0;
+static void gpu_shutdown(void);
 
 static void save_console(void){
     CONSOLE_SCREEN_BUFFER_INFO s;
@@ -51,6 +54,7 @@ static void restore_console(void){
     if (g_have_cursor) SetConsoleCursorInfo(g_out, &g_orig_cursor);
     if (g_have_out_mode) SetConsoleMode(g_out, g_orig_out_mode);
     if (g_have_in_mode) SetConsoleMode(g_in, g_orig_in_mode);
+    gpu_shutdown();
 }
 static BOOL WINAPI ctrl_handler(DWORD type){
     (void)type;
@@ -186,6 +190,210 @@ static void format_uptime(char*out,size_t n){
     snprintf(out, n, "%llud %02lluh %02llum %02llus", d, h, m, sec);
 }
 
+// ==== NVIDIA GPU via NVML ====================================================================
+// NVML (the library nvidia-smi uses) ships with every NVIDIA driver as nvml.dll. We load it at
+// runtime, so there is no SDK, no link flag, and nothing breaks on a PC without NVIDIA.
+// Only the handful of types we need are declared here; values match NVIDIA's nvml.h.
+typedef int nvmlReturn_t;
+typedef struct nvmlDevice_st *nvmlDevice_t;
+typedef struct { unsigned int gpu, memory; } nvmlUtilization_t;
+typedef struct { unsigned long long total, free, used; } nvmlMemory_t;
+#define NVML_SUCCESS 0
+#define NVML_TEMPERATURE_GPU 0
+#define NVML_CLOCK_GRAPHICS 0
+#define NVML_CLOCK_MEM 2
+#define NVML_DEVICE_NAME_V2_BUFFER_SIZE 96
+
+typedef nvmlReturn_t (*nvml_void_fn)(void);
+typedef nvmlReturn_t (*nvml_count_fn)(unsigned int *);
+typedef nvmlReturn_t (*nvml_handle_fn)(unsigned int, nvmlDevice_t *);
+typedef nvmlReturn_t (*nvml_name_fn)(nvmlDevice_t, char *, unsigned int);
+typedef nvmlReturn_t (*nvml_util_fn)(nvmlDevice_t, nvmlUtilization_t *);
+typedef nvmlReturn_t (*nvml_mem_fn)(nvmlDevice_t, nvmlMemory_t *);
+typedef nvmlReturn_t (*nvml_uint_fn)(nvmlDevice_t, unsigned int *);
+typedef nvmlReturn_t (*nvml_enum_uint_fn)(nvmlDevice_t, int, unsigned int *);
+typedef nvmlReturn_t (*nvml_ull_fn)(nvmlDevice_t, unsigned long long *);
+
+static struct {
+    HMODULE dll;
+    nvml_void_fn init, shutdown;
+    nvml_count_fn count;
+    nvml_handle_fn handle;
+    nvml_name_fn name;
+    nvml_util_fn util;
+    nvml_mem_fn mem;
+    nvml_enum_uint_fn temp, clock;
+    nvml_uint_fn power, power_limit, fan;
+    nvml_ull_fn reasons;
+} g_nvml;
+
+enum { GPU_NONE, GPU_OK, GPU_LOST };
+static int g_gpu_state = GPU_NONE;
+static nvmlDevice_t g_gpu_dev;
+static unsigned int g_gpu_count;
+static char g_gpu_name[NVML_DEVICE_NAME_V2_BUFFER_SIZE];
+static ULONGLONG g_gpu_retry_at;
+// Ctrl+C runs restore_console() on another thread; this lock keeps it from unloading the DLL
+// while the main thread is inside an NVML call.
+static CRITICAL_SECTION g_gpu_lock;
+
+// Turns the clocks-event-reasons bitmask into a few words. Worst cause first.
+static const char *gpu_limit_words(unsigned long long reasons){
+    if (reasons & (0x40ULL | 0x20ULL)) return "TOO HOT";      // HW / SW thermal slowdown
+    if (reasons & (0x8ULL | 0x80ULL))  return "HW slowdown";  // HW slowdown / power brake
+    if (reasons & 0x4ULL)              return "power cap";    // boosting up to the power limit: normal under load
+    if (reasons & 0x1ULL)              return "idle";
+    return "none";
+}
+
+// Try System32 only first, so a planted nvml.dll elsewhere on the search path can't be picked up.
+static HMODULE nvml_load_dll(void){
+    HMODULE m = LoadLibraryExW(L"nvml.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (m) return m;
+    // Older drivers keep it next to nvidia-smi instead.
+    wchar_t path[MAX_PATH];
+    DWORD n = GetEnvironmentVariableW(L"ProgramW6432", path, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return NULL;
+    if (wcslen(path) + wcslen(L"\\NVIDIA Corporation\\NVSMI\\nvml.dll") >= MAX_PATH) return NULL;
+    wcscat(path, L"\\NVIDIA Corporation\\NVSMI\\nvml.dll");
+    return LoadLibraryExW(path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+}
+
+// Init NVML and grab GPU 0. Caller holds g_gpu_lock.
+static int nvml_open_device(void){
+    if (g_nvml.init() != NVML_SUCCESS) return 0;
+    if (g_nvml.count(&g_gpu_count) != NVML_SUCCESS || g_gpu_count == 0
+        || g_nvml.handle(0, &g_gpu_dev) != NVML_SUCCESS){
+        g_nvml.shutdown();
+        return 0;
+    }
+    if (!g_nvml.name || g_nvml.name(g_gpu_dev, g_gpu_name, sizeof g_gpu_name) != NVML_SUCCESS)
+        snprintf(g_gpu_name, sizeof g_gpu_name, "NVIDIA GPU");
+    return 1;
+}
+
+static void gpu_init(void){
+    InitializeCriticalSection(&g_gpu_lock);
+    g_nvml.dll = nvml_load_dll();
+    if (!g_nvml.dll) return;
+    // GetProcAddress returns a generic FARPROC; go through void* to cast it to the real signature.
+#define NVML_SYM(field, type, sym) g_nvml.field = (type)(void *)GetProcAddress(g_nvml.dll, sym)
+    NVML_SYM(init,        nvml_void_fn,      "nvmlInit_v2");
+    NVML_SYM(shutdown,    nvml_void_fn,      "nvmlShutdown");
+    NVML_SYM(count,       nvml_count_fn,     "nvmlDeviceGetCount_v2");
+    NVML_SYM(handle,      nvml_handle_fn,    "nvmlDeviceGetHandleByIndex_v2");
+    NVML_SYM(name,        nvml_name_fn,      "nvmlDeviceGetName");
+    NVML_SYM(util,        nvml_util_fn,      "nvmlDeviceGetUtilizationRates");
+    NVML_SYM(mem,         nvml_mem_fn,       "nvmlDeviceGetMemoryInfo");
+    NVML_SYM(temp,        nvml_enum_uint_fn, "nvmlDeviceGetTemperature");
+    NVML_SYM(power,       nvml_uint_fn,      "nvmlDeviceGetPowerUsage");
+    NVML_SYM(power_limit, nvml_uint_fn,      "nvmlDeviceGetEnforcedPowerLimit");
+    NVML_SYM(clock,       nvml_enum_uint_fn, "nvmlDeviceGetClockInfo");
+    NVML_SYM(fan,         nvml_uint_fn,      "nvmlDeviceGetFanSpeed");
+    NVML_SYM(reasons,     nvml_ull_fn,       "nvmlDeviceGetCurrentClocksEventReasons");
+    // Same bitmask under its older name, for drivers that predate the rename.
+    if (!g_nvml.reasons) NVML_SYM(reasons, nvml_ull_fn, "nvmlDeviceGetCurrentClocksThrottleReasons");
+#undef NVML_SYM
+    if (g_nvml.init && g_nvml.shutdown && g_nvml.count && g_nvml.handle && g_nvml.util && g_nvml.mem
+        && nvml_open_device()){
+        g_gpu_state = GPU_OK;
+        return;
+    }
+    FreeLibrary(g_nvml.dll);
+    memset(&g_nvml, 0, sizeof g_nvml);
+}
+
+static void gpu_shutdown(void){
+    if (!g_nvml.dll) return;
+    EnterCriticalSection(&g_gpu_lock);
+    if (g_gpu_state == GPU_OK) g_nvml.shutdown();
+    FreeLibrary(g_nvml.dll);
+    memset(&g_nvml, 0, sizeof g_nvml);
+    g_gpu_state = GPU_NONE;
+    LeaveCriticalSection(&g_gpu_lock);
+}
+
+// One sample of GPU 0. -1 in a field means "couldn't read it", shown as "--".
+typedef struct {
+    double util_pct, mem_pct;
+    unsigned long long mem_used, mem_total;
+    int temp_c, watts, watts_limit, fan_pct, core_mhz, mem_mhz;
+    int have_reasons; unsigned long long reasons;
+} GpuSample;
+
+// Returns the state the sample was taken in: GPU_OK fills *s, otherwise there is nothing to show.
+static int gpu_sample(GpuSample *s){
+    if (!g_nvml.dll) return GPU_NONE;
+    EnterCriticalSection(&g_gpu_lock);
+    int state = g_gpu_state;
+    // After a driver update or reset, try to reconnect, but no more than once every 5 s.
+    if (state == GPU_LOST && GetTickCount64() >= g_gpu_retry_at){
+        if (nvml_open_device()) state = g_gpu_state = GPU_OK;
+        else g_gpu_retry_at = GetTickCount64() + 5000;
+    }
+    if (state == GPU_OK){
+        nvmlUtilization_t u; nvmlMemory_t m;
+        if (g_nvml.util(g_gpu_dev, &u) != NVML_SUCCESS || g_nvml.mem(g_gpu_dev, &m) != NVML_SUCCESS){
+            g_nvml.shutdown();
+            state = g_gpu_state = GPU_LOST;
+            g_gpu_retry_at = GetTickCount64() + 5000;
+        } else {
+            unsigned int v;
+            s->util_pct = u.gpu;
+            s->mem_used = m.used; s->mem_total = m.total;
+            s->mem_pct = m.total ? (double)m.used / (double)m.total * 100.0 : 0.0;
+            // Power is in milliwatts; round to whole watts.
+            s->temp_c      = (g_nvml.temp  && g_nvml.temp(g_gpu_dev, NVML_TEMPERATURE_GPU, &v) == NVML_SUCCESS) ? (int)v : -1;
+            s->watts       = (g_nvml.power && g_nvml.power(g_gpu_dev, &v) == NVML_SUCCESS) ? (int)((v + 500) / 1000) : -1;
+            s->watts_limit = (g_nvml.power_limit && g_nvml.power_limit(g_gpu_dev, &v) == NVML_SUCCESS) ? (int)((v + 500) / 1000) : -1;
+            s->fan_pct     = (g_nvml.fan   && g_nvml.fan(g_gpu_dev, &v) == NVML_SUCCESS) ? (int)v : -1;
+            s->core_mhz    = (g_nvml.clock && g_nvml.clock(g_gpu_dev, NVML_CLOCK_GRAPHICS, &v) == NVML_SUCCESS) ? (int)v : -1;
+            s->mem_mhz     = (g_nvml.clock && g_nvml.clock(g_gpu_dev, NVML_CLOCK_MEM, &v) == NVML_SUCCESS) ? (int)v : -1;
+            s->have_reasons = g_nvml.reasons && g_nvml.reasons(g_gpu_dev, &s->reasons) == NVML_SUCCESS;
+        }
+    }
+    LeaveCriticalSection(&g_gpu_lock);
+    return state;
+}
+
+// "--" for a field NVML couldn't give us.
+static const char *gpu_field(char *buf, size_t n, const char *fmt, int v){
+    if (v < 0) return "--";
+    snprintf(buf, n, fmt, v);
+    return buf;
+}
+
+// Draws the GPU rows starting at row *y and advances it: three rows normally, one when there's no GPU to show.
+static void draw_gpu(HANDLE h, SHORT *y, int barw){
+    GpuSample s;
+    int state = gpu_sample(&s);
+    if (state == GPU_NONE){
+        goto_xy(h,0,(*y)++); printf("GPU        :  not available (no NVIDIA driver found)" EOL);
+        return;
+    }
+    if (state == GPU_LOST){
+        goto_xy(h,0,(*y)++); printf("GPU        :  lost contact, retrying" EOL);
+        return;
+    }
+    goto_xy(h,0,(*y)++); printf("GPU        : "); draw_bar(s.util_pct, barw); printf("  %s", g_gpu_name);
+    if (g_gpu_count > 1) printf(" (GPU 1 of %u)", g_gpu_count);
+    printf(EOL);
+
+    char used[32], total[32]; human_bytes((double)s.mem_used,used,sizeof used); human_bytes((double)s.mem_total,total,sizeof total);
+    goto_xy(h,0,(*y)++); printf("VRAM       : "); draw_bar(s.mem_pct, barw); printf("  used %s of %s" EOL, used, total);
+
+    char tb[16], wb[16], lb[16], fb[16], cb[16], mb[16];
+    const char *deg = g_use_utf8 ? "°C" : "C";
+    goto_xy(h,0,(*y)++);
+    printf("GPU detail :  %s%s   %s / %s W   fan %s   core %s MHz   mem %s MHz   limit: %s" EOL,
+           gpu_field(tb,sizeof tb,"%d",s.temp_c), s.temp_c < 0 ? "" : deg,
+           gpu_field(wb,sizeof wb,"%d",s.watts), gpu_field(lb,sizeof lb,"%d",s.watts_limit),
+           gpu_field(fb,sizeof fb,"%d%%",s.fan_pct),
+           gpu_field(cb,sizeof cb,"%d",s.core_mhz), gpu_field(mb,sizeof mb,"%d",s.mem_mhz),
+           s.have_reasons ? gpu_limit_words(s.reasons) : "--");
+}
+// ==== end NVIDIA GPU ==========================================================================
+
 // ---- header (draw once), clock updater (draws inside header) ----
 static void draw_header(void){
     SHORT width = win_width();
@@ -233,6 +441,7 @@ static void draw_metrics(HANDLE h, int barw){
     goto_xy(h,0,y++); printf("CPU Usage  : "); draw_bar(cpu<0?0:cpu, barw); printf(EOL);
     char t[32],a[32]; human_bytes((double)m.total,t,sizeof t); human_bytes((double)m.avail,a,sizeof a);
     goto_xy(h,0,y++); printf("Memory     : "); draw_bar(m.used_pct, barw); printf("  total %s, free %s" EOL, t,a);
+    draw_gpu(h, &y, barw);
     char dt[32],df[32]; human_bytes((double)d.total,dt,sizeof dt); human_bytes((double)d.freeb,df,sizeof df);
     goto_xy(h,0,y++); printf("Disk (all) : "); draw_bar(d.used_pct, barw); printf("  total %s, free %s" EOL, dt,df);
     char rin[32], rout[32]; human_bytes(n.inBps,rin,sizeof rin); human_bytes(n.outBps,rout,sizeof rout);
@@ -245,7 +454,7 @@ static void draw_metrics(HANDLE h, int barw){
     SHORT w = win_width();
     goto_xy(h,0,y++);
     for(int i=0;i<w;i++) fputs(bx(BX_H,"-"), stdout);
-    printf("\nTip: A toggles ASCII/Unicode borders. Q quits. Refresh 1s." EOL);
+    printf("\nTip: A toggles ASCII/Unicode borders. Q quits. Refresh 1s." EOL VT_CLEAR_BELOW);
     fflush(stdout);
 }
 
@@ -255,6 +464,7 @@ int main(){
     HANDLE in=GetStdHandle(STD_INPUT_HANDLE);
     g_out=h; g_in=in;
     save_console();
+    gpu_init(); // before the Ctrl handler, which may shut it down
     SetConsoleCtrlHandler(ctrl_handler, TRUE);
 
     SetConsoleTitleA("GreenScope - System Monitor");
