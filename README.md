@@ -22,7 +22,7 @@ Green-on-black Windows console system monitor written in C. Minimal, fast, retro
    ```
 3. Clone and build:
    ```bash
-   git clone https://github.com/<yourname>/greenscope.git
+   git clone https://github.com/Jffrsntaylor/greenscope.git
    cd greenscope
    ./build.bat
    ```
@@ -45,7 +45,7 @@ gcc -O2 -s -o GreenScope.exe src/greenscope.c greenscope_res.o -lIphlpapi
 - (Optional) Create a Desktop **shortcut** → **Properties** → **Change Icon…** and select `icons/greenscope.ico`.
 
 ## Notes
-- Tested on Windows 10/11 terminals. Toggle ASCII with `A` if you see border glitches.
+- Tested on Windows 10/11 terminals.
 - No admin privileges required. No network calls, no file writes.
 
 ## License
